@@ -1,11 +1,22 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { useNavigate, useLocation } from "react-router-dom";
 import {
   Search, X, ChevronRight, CheckCircle2, Circle,
-  RefreshCw, Edit3, Save, Plus, Trash2, Bell, Menu, Zap
+  RefreshCw, Edit3, Save, Plus, Trash2, Bell, Menu, Zap, LogIn, LogOut, Database
 } from "lucide-react";
 import { SECTIONS, POLICY_LOG, SHIFT_CHECKLISTS, QUICK_FINDER_SCENARIOS } from "./data/sop.js";
+import { db, auth, isFirebaseConfigured } from "./firebase.js";
+import {
+  collection, getDocs, doc, updateDoc, addDoc, deleteDoc,
+  query, orderBy, getDoc, setDoc,
+} from "firebase/firestore";
+import {
+  signInWithEmailAndPassword, signOut, onAuthStateChanged,
+} from "firebase/auth";
+import { seedFirestore } from "./scripts/seed.js";
 import "./App.css";
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 function highlight(text, q) {
   if (!q || !text) return text;
   const regex = new RegExp(`(${q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")})`, "gi");
@@ -32,9 +43,26 @@ function searchAll(query, sections) {
   return results;
 }
 
+function getActiveFromPath(pathname) {
+  if (pathname.startsWith("/section/")) return pathname.slice("/section/".length);
+  if (pathname === "/policylog") return "policylog";
+  return "home";
+}
+
+function friendlyAuthError(code) {
+  switch (code) {
+    case "auth/user-not-found":
+    case "auth/wrong-password":
+    case "auth/invalid-credential": return "Incorrect email or password.";
+    case "auth/invalid-email": return "Invalid email address.";
+    case "auth/too-many-requests": return "Too many attempts. Please try again later.";
+    default: return "Sign-in failed. Please try again.";
+  }
+}
+
 // ─── Sidebar ──────────────────────────────────────────────────────────────────
-function Sidebar({ active, setActive, open, setOpen }) {
-  const groups = [...new Set(SECTIONS.map((s) => s.group))];
+function Sidebar({ sections, active, setActive, open, setOpen }) {
+  const groups = [...new Set(sections.map((s) => s.group))];
   return (
     <>
       {open && <div className="sidebar-overlay" onClick={() => setOpen(false)} />}
@@ -54,7 +82,7 @@ function Sidebar({ active, setActive, open, setOpen }) {
           {groups.map((g) => (
             <div key={g} className="nav-group">
               <div className="nav-label">{g}</div>
-              {SECTIONS.filter((s) => s.group === g).map((s) => (
+              {sections.filter((s) => s.group === g).map((s) => (
                 <button
                   key={s.id}
                   className={`nav-item${active === s.id ? " active" : ""}`}
@@ -77,10 +105,69 @@ function Sidebar({ active, setActive, open, setOpen }) {
   );
 }
 
+// ─── Login Modal ──────────────────────────────────────────────────────────────
+function LoginModal({ onClose }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const emailRef = useRef();
+  useEffect(() => emailRef.current?.focus(), []);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setError("");
+    setLoading(true);
+    try {
+      await signInWithEmailAndPassword(auth, email, password);
+      onClose();
+    } catch (err) {
+      setError(friendlyAuthError(err.code));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="modal-bg" onClick={onClose}>
+      <div className="modal login-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="lm-head">
+          <h2 className="lm-title">Admin Sign In</h2>
+          <button className="lm-close" onClick={onClose}><X size={16} /></button>
+        </div>
+        <p className="lm-sub">Sign in to enable edit mode and persist changes.</p>
+        <form className="lm-form" onSubmit={submit}>
+          <input
+            ref={emailRef}
+            className="edit-in"
+            type="email"
+            placeholder="Email address"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            required
+          />
+          <input
+            className="edit-in"
+            type="password"
+            placeholder="Password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            required
+          />
+          {error && <div className="lm-error">{error}</div>}
+          <button className="save-btn lm-submit" type="submit" disabled={loading}>
+            <LogIn size={13} />{loading ? "Signing in…" : "Sign In"}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 // ─── What's New ───────────────────────────────────────────────────────────────
-function WhatsNew({ onNav }) {
+function WhatsNew({ log, onNav }) {
   const [gone, setGone] = useState(false);
-  const fresh = POLICY_LOG.filter((p) => p.isNew);
+  const fresh = log.filter((p) => p.isNew);
   if (gone || !fresh.length) return null;
   return (
     <div className="whatsnew">
@@ -167,11 +254,40 @@ function QuickFinder({ onNav }) {
 }
 
 // ─── Shift Checklist ──────────────────────────────────────────────────────────
-function Checklist() {
+function Checklist({ user }) {
   const [shift, setShift] = useState("1st");
-  const [checked, setChecked] = useState({});
-  const toggle = (id) => setChecked((p) => ({ ...p, [id]: !p[id] }));
-  const reset = () => setChecked({});
+  const [allShiftChecked, setAllShiftChecked] = useState({});
+
+  const checked = allShiftChecked[shift] || {};
+
+  // Load persisted state from Firestore when user logs in
+  useEffect(() => {
+    if (!user || !db) return;
+    getDoc(doc(db, "checklists", user.uid)).then((snap) => {
+      if (snap.exists()) setAllShiftChecked(snap.data());
+    }).catch(() => {});
+  }, [user]);
+
+  const persistChecked = useCallback(async (shift, newChecked) => {
+    if (!user || !db) return;
+    try {
+      await setDoc(doc(db, "checklists", user.uid), { [shift]: newChecked }, { merge: true });
+    } catch {
+      // non-critical — local state already updated
+    }
+  }, [user]);
+
+  const toggle = (id) => {
+    const newChecked = { ...checked, [id]: !checked[id] };
+    setAllShiftChecked((p) => ({ ...p, [shift]: newChecked }));
+    persistChecked(shift, newChecked);
+  };
+
+  const reset = () => {
+    setAllShiftChecked((p) => ({ ...p, [shift]: {} }));
+    persistChecked(shift, {});
+  };
+
   const items = SHIFT_CHECKLISTS[shift];
   const done = items.filter((i) => checked[i.id]).length;
   const pct = Math.round((done / items.length) * 100);
@@ -181,7 +297,7 @@ function Checklist() {
       <div className="cl-head">
         <div className="cl-tabs">
           {["1st", "2nd", "3rd"].map((s) => (
-            <button key={s} className={`cl-tab${shift === s ? " active" : ""}`} onClick={() => { setShift(s); reset(); }}>{s} Shift</button>
+            <button key={s} className={`cl-tab${shift === s ? " active" : ""}`} onClick={() => setShift(s)}>{s} Shift</button>
           ))}
         </div>
         <span className="cl-count">{done}/{items.length}</span>
@@ -229,6 +345,12 @@ function SectionView({ section, editMode, onSave }) {
         <div>
           <h1 className="sv-title">{section.label}</h1>
           <span className="sv-group">{section.group}</span>
+          {section.lastEditedAt && (
+            <span className="sv-edited">
+              Last edited {new Date(section.lastEditedAt).toLocaleDateString()}
+              {section.lastEditedBy ? ` by ${section.lastEditedBy}` : ""}
+            </span>
+          )}
         </div>
       </div>
 
@@ -343,7 +465,7 @@ function PolicyLog({ log, editMode, onAdd, onDelete }) {
 
       <div className="pl-list">
         {log.map((e, i) => (
-          <div key={i} className={`pl-entry${e.isNew ? " new" : ""}`}>
+          <div key={e._id || i} className={`pl-entry${e.isNew ? " new" : ""}`}>
             <div className="ple-meta">
               <span className="ple-date">{e.date}</span>
               {e.isNew && <span className="ple-badge">New</span>}
@@ -358,44 +480,158 @@ function PolicyLog({ log, editMode, onAdd, onDelete }) {
   );
 }
 
+// ─── Loading Spinner ──────────────────────────────────────────────────────────
+function Spinner() {
+  return (
+    <div className="spinner-wrap">
+      <div className="spinner" />
+      <p className="spinner-label">Loading SOP data…</p>
+    </div>
+  );
+}
+
 // ─── App ──────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [active, setActive] = useState("home");
+  const navigate = useNavigate();
+  const location = useLocation();
+
+  const [active, setActiveState] = useState(() => getActiveFromPath(location.pathname));
   const [searchOpen, setSearchOpen] = useState(false);
   const [editMode, setEditMode] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [sections, setSections] = useState(SECTIONS);
   const [log, setLog] = useState(POLICY_LOG);
   const [toast, setToast] = useState(false);
+  const [dataLoading, setDataLoading] = useState(isFirebaseConfigured);
+  const [user, setUser] = useState(null);
+  const [authReady, setAuthReady] = useState(!isFirebaseConfigured);
+  const [loginOpen, setLoginOpen] = useState(false);
 
+  // ── Auth state listener ────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!isFirebaseConfigured) return;
+    const unsub = onAuthStateChanged(auth, (u) => {
+      setUser(u);
+      setAuthReady(true);
+    });
+    return unsub;
+  }, []);
+
+  // Logout clears edit mode
+  const handleLogout = async () => {
+    await signOut(auth);
+    setEditMode(false);
+  };
+
+  // ── Sync active ↔ URL ──────────────────────────────────────────────────────
+  useEffect(() => {
+    setActiveState(getActiveFromPath(location.pathname));
+  }, [location.pathname]);
+
+  const nav = useCallback((id) => {
+    setSidebarOpen(false);
+    if (id === "home") navigate("/");
+    else if (id === "policylog") navigate("/policylog");
+    else navigate("/section/" + id);
+  }, [navigate]);
+
+  // ── Keyboard shortcuts ─────────────────────────────────────────────────────
   useEffect(() => {
     const h = (e) => {
       if ((e.metaKey || e.ctrlKey) && e.key === "k") { e.preventDefault(); setSearchOpen(true); }
-      if (e.key === "Escape") setSearchOpen(false);
+      if (e.key === "Escape") { setSearchOpen(false); setLoginOpen(false); }
     };
     window.addEventListener("keydown", h);
     return () => window.removeEventListener("keydown", h);
   }, []);
 
+  // ── Load data from Firestore ───────────────────────────────────────────────
+  useEffect(() => {
+    if (!isFirebaseConfigured) return;
+    async function loadData() {
+      try {
+        const [secSnap, logSnap] = await Promise.all([
+          getDocs(query(collection(db, "sections"), orderBy("order"))),
+          getDocs(query(collection(db, "policyLog"), orderBy("order"))),
+        ]);
+        if (!secSnap.empty) {
+          setSections(secSnap.docs.map((d) => ({ ...d.data(), id: d.id })));
+        }
+        if (!logSnap.empty) {
+          setLog(logSnap.docs.map((d) => ({ ...d.data(), _id: d.id })));
+        }
+      } catch (err) {
+        console.warn("Firestore unavailable, using local data:", err.message);
+      } finally {
+        setDataLoading(false);
+      }
+    }
+    loadData();
+  }, []);
+
+  // ── Writes ─────────────────────────────────────────────────────────────────
   const showToast = () => { setToast(true); setTimeout(() => setToast(false), 2500); };
 
-  const saveSection = useCallback((id, updates) => {
-    setSections((p) => p.map((s) => s.id === id ? { ...s, ...updates } : s));
+  const saveSection = useCallback(async (id, updates) => {
+    const enriched = {
+      ...updates,
+      lastEditedAt: new Date().toISOString(),
+      lastEditedBy: user?.email || "admin",
+    };
+    setSections((p) => p.map((s) => s.id === id ? { ...s, ...enriched } : s));
+    if (db) {
+      try {
+        await updateDoc(doc(db, "sections", id), enriched);
+      } catch (err) {
+        console.error("saveSection failed:", err);
+      }
+    }
+    showToast();
+  }, [user]);
+
+  const addEntry = useCallback(async (entry) => {
+    if (db) {
+      try {
+        const ref = await addDoc(collection(db, "policyLog"), {
+          ...entry,
+          order: 0,
+          createdAt: new Date().toISOString(),
+        });
+        setLog((p) => [{ ...entry, _id: ref.id }, ...p]);
+      } catch (err) {
+        console.error("addEntry failed:", err);
+        setLog((p) => [entry, ...p]);
+      }
+    } else {
+      setLog((p) => [entry, ...p]);
+    }
     showToast();
   }, []);
 
-  const addEntry = useCallback((entry) => { setLog((p) => [entry, ...p]); showToast(); }, []);
-  const deleteEntry = useCallback((i) => { if (window.confirm("Delete this entry?")) setLog((p) => p.filter((_, idx) => idx !== i)); }, []);
+  const deleteEntry = useCallback(async (i) => {
+    if (!window.confirm("Delete this entry?")) return;
+    const entry = log[i];
+    setLog((p) => p.filter((_, idx) => idx !== i));
+    if (db && entry._id) {
+      try {
+        await deleteDoc(doc(db, "policyLog", entry._id));
+      } catch (err) {
+        console.error("deleteEntry failed:", err);
+      }
+    }
+  }, [log]);
 
-  const nav = (id) => { setActive(id); setSidebarOpen(false); };
+  // ── Derived ────────────────────────────────────────────────────────────────
   const cur = sections.find((s) => s.id === active);
+
+  if (!authReady || dataLoading) return <Spinner />;
 
   return (
     <div className="app">
-      <Sidebar active={active} setActive={nav} open={sidebarOpen} setOpen={setSidebarOpen} />
+      <Sidebar sections={sections} active={active} setActive={nav} open={sidebarOpen} setOpen={setSidebarOpen} />
 
       <div className="main">
-        <WhatsNew onNav={nav} />
+        <WhatsNew log={log} onNav={nav} />
 
         <header className="topbar">
           <button className="menu-btn" onClick={() => setSidebarOpen(true)}><Menu size={18} /></button>
@@ -404,9 +640,29 @@ export default function App() {
           </button>
           <div className="tb-right">
             {editMode && <span className="edit-ind"><Edit3 size={12} /> Editing</span>}
-            <button className={`edit-toggle${editMode ? " on" : ""}`} onClick={() => setEditMode((p) => !p)}>
-              <Edit3 size={13} />{editMode ? "Done" : "Edit"}
-            </button>
+            {user ? (
+              <>
+                <button
+                  className={`edit-toggle${editMode ? " on" : ""}`}
+                  onClick={() => setEditMode((p) => !p)}
+                >
+                  <Edit3 size={13} />{editMode ? "Done" : "Edit"}
+                </button>
+                <span className="tb-user" title={user.email}>{user.email}</span>
+                <button className="tb-logout" onClick={handleLogout} title="Sign out">
+                  <LogOut size={14} />
+                </button>
+              </>
+            ) : (
+              <button className="tb-login" onClick={() => setLoginOpen(true)}>
+                <LogIn size={13} /> Sign In
+              </button>
+            )}
+            {import.meta.env.DEV && isFirebaseConfigured && (
+              <button className="tb-seed" onClick={seedFirestore} title="Seed Firestore with local data">
+                <Database size={13} /> Seed DB
+              </button>
+            )}
           </div>
         </header>
 
@@ -423,7 +679,7 @@ export default function App() {
                 </div>
               </div>
               <QuickFinder onNav={nav} />
-              <Checklist />
+              <Checklist user={user} />
             </div>
           )}
           {active === "policylog" && (
@@ -436,6 +692,8 @@ export default function App() {
       {searchOpen && (
         <SearchModal onClose={() => setSearchOpen(false)} onNav={(id) => { nav(id); setSearchOpen(false); }} sections={sections} />
       )}
+
+      {loginOpen && <LoginModal onClose={() => setLoginOpen(false)} />}
     </div>
   );
 }
